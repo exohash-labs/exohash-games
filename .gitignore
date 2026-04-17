@@ -1,0 +1,18 @@
+# Test harness — lives in devkit, kept locally for regenerating READMEs
+# but excluded from the public source-of-truth repo.
+/*/main.go
+/*/results.txt
+
+# Compiled test-runner binaries (produced by local `go build`).
+/*/dice
+/*/crash
+/*/mines
+
+# Go module files — the harness is the only consumer; without it,
+# the repo has no Go build surface. Published repo is source + WASM only.
+go.mod
+go.sum
+
+# Go workspace files — committed at the monorepo root, not per-repo.
+go.work
+go.work.sum
