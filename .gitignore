@@ -16,3 +16,6 @@ go.sum
 # Go workspace files — committed at the monorepo root, not per-repo.
 go.work
 go.work.sum
+
+# Local scratch space — TinyGo build outputs, wasm-hash comparisons, notes.
+/playtest/
