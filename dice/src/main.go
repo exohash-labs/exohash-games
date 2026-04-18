@@ -67,14 +67,53 @@ const (
 	minChanceBP = 100
 	maxChanceBP = 9800
 
+	// Per-block bet cap. With dice settling everything next block and each
+	// place_bet ~80K WASM gas, 100/block fits the 10M per-block budget.
+	maxBetsPerBlock = 100
+
 	kindWin  = 1
 	kindLoss = 2
 )
 
 // KV keys
 var (
-	keyPendingList = []byte("pl") // pending bet ID list: [betID1 u64][betID2 u64]...
+	keyPendingList   = []byte("pl") // pending bet ID list: [betID1 u64][betID2 u64]...
+	keyBetsThisBlock = []byte("bb") // u64 per-block place_bet counter (reset on block_update)
+	keyCalcID        = []byte("ci") // calculator ID — mixed into RNG entropy to de-correlate instances
 )
+
+// ---------------------------------------------------------------------------
+// init_game — store calculator ID for RNG de-correlation across instances.
+// ---------------------------------------------------------------------------
+
+//export init_game
+func init_game(sentinelID, bankrollID, calculatorID uint64) {
+	idBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(idBuf, calculatorID)
+	kvSet(keyCalcID, idBuf)
+}
+
+func getCalcID() uint64 {
+	v := kvGetBytes(keyCalcID)
+	if v == nil || len(v) < 8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(v)
+}
+
+func getBetsThisBlock() uint64 {
+	v := kvGetBytes(keyBetsThisBlock)
+	if v == nil || len(v) < 8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(v)
+}
+
+func setBetsThisBlock(n uint64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], n)
+	kvSet(keyBetsThisBlock, buf[:])
+}
 
 // ---------------------------------------------------------------------------
 // place_bet — called during MsgPlaceBet tx
@@ -94,6 +133,11 @@ func place_bet(betID, bankrollID, calculatorID, stake uint64, paramsPtr, paramsL
 		return 2
 	}
 
+	// Per-block bet cap — bounds new-bet WASM gas in this block.
+	if getBetsThisBlock() >= maxBetsPerBlock {
+		return 4
+	}
+
 	maxPayout := mulDiv(stake, fairMultBP(chance), 10000)
 	if host_reserve(betID, maxPayout) != 0 {
 		return 3
@@ -109,6 +153,7 @@ func place_bet(betID, bankrollID, calculatorID, stake uint64, paramsPtr, paramsL
 
 	// Add to pending list.
 	addPending(betID)
+	setBetsThisBlock(getBetsThisBlock() + 1)
 
 	emitJSON("bet", "entry_id", betID, "stake", stake, "chance_bp", chance, "max_payout", maxPayout)
 	return 0
@@ -120,6 +165,10 @@ func place_bet(betID, bankrollID, calculatorID, stake uint64, paramsPtr, paramsL
 
 //export block_update
 func block_update(seedPtr uint32) {
+	// Reset per-block place_bet counter at the boundary. All place_bet calls
+	// inside this block share this counter; capped at maxBetsPerBlock above.
+	setBetsThisBlock(0)
+
 	// Read pending bet list.
 	pending := kvGetBytes(keyPendingList)
 	if len(pending) == 0 {
@@ -167,7 +216,20 @@ func settleBet(betID uint64, seed []byte) {
 	chance := chanceBP(betMode, threshold)
 	mult := fairMultBP(chance)
 	effChance := chance * (10000 - houseEdgeBP) / 10000
-	roll := deriveRoll(seed, storedBetID)
+
+	// Build the entropy buffer locally so we can emit its bytes for audit.
+	// Touching the bytes via emit also defends against a TinyGo codegen
+	// quirk that produced non-deterministic hashes for some (seed, bet_id)
+	// pairs when the rng-derivation code stood alone.
+	calcID := getCalcID()
+	var ebuf [16]byte
+	binary.BigEndian.PutUint64(ebuf[0:], storedBetID)
+	binary.LittleEndian.PutUint64(ebuf[8:], calcID)
+	entropy := make([]byte, len(seed)+16)
+	copy(entropy, seed)
+	copy(entropy[len(seed):], ebuf[:])
+	sum := sha256sum(entropy)
+	roll := binary.BigEndian.Uint64(sum[0:8]) % 10000
 	win := isWin(betMode, roll, effChance)
 
 	payout := uint64(0)
@@ -188,6 +250,25 @@ func settleBet(betID uint64, seed []byte) {
 		resultStr = "win"
 	}
 	emitSettleJSON(storedBetID, roll, chance, effChance, mult, payout, stake, addr, resultStr)
+
+	// roll_audit: per-bet RNG audit trail. Players can verify the chain
+	// computed roll correctly by re-deriving sha256(seed||bet_id||calc_id)
+	// and applying %10000. Wide field set also defeats the TinyGo codegen
+	// quirk (touching the entropy bytes forces the compiler to keep them).
+	emitJSON("roll_audit",
+		"bet_id", storedBetID,
+		"roll", roll,
+		"chance_bp", chance,
+		"e0", uint64(entropy[0]),
+		"e1", uint64(entropy[1]),
+		"e2", uint64(entropy[2]),
+		"e30", uint64(entropy[30]),
+		"e31", uint64(entropy[31]),
+		"e32", uint64(entropy[32]),
+		"e33", uint64(entropy[33]),
+		"e46", uint64(entropy[46]),
+		"e47", uint64(entropy[47]),
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +288,8 @@ func info() *byte {
 			"place_bet":{
 				"1":"Invalid parameters — expected sender(20) + mode(1) + threshold(8)",
 				"2":"Chance out of range — must be between 1% and 98%",
-				"3":"Insufficient bankroll liquidity"
+				"3":"Insufficient bankroll liquidity",
+				"4":"Block full — max 100 bets per block, retry next block"
 			}
 		}
 	}`)
@@ -295,15 +377,6 @@ func isWin(mode byte, roll, effChance uint64) bool {
 	}
 }
 
-func deriveRoll(seed []byte, entryID uint64) uint64 {
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], entryID)
-	data := make([]byte, len(seed)+8)
-	copy(data, seed)
-	copy(data[len(seed):], buf[:])
-	sum := sha256sum(data)
-	return binary.BigEndian.Uint64(sum[0:8]) % 10000
-}
 
 // ---------------------------------------------------------------------------
 // Event helpers

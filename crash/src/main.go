@@ -77,12 +77,20 @@ const (
 	statusSettled    byte = 2
 
 	cfgSize   = 48
-	roundSize = 57 // extended with running counters to avoid O(N) countActive per tick
-	betSize   = 18
+	roundSize = 58 // [0..56] state, [57]=bets_in_current_block (uint8)
+	betSize   = 25 // [0..7]=betID [8..15]=stake [16]=status [17..24]=target_tick
 
 	maxHistory     = 20
 	crashedBlocks  = 5
 	maxAddrBufSize = 64
+
+	// Single hard cap — everything fits in one block_update at this size.
+	// 100 settles ≈ 9M WASM gas + 6M SDK gas; both under 10M cap with margin.
+	// To scale beyond 100 players, deploy a second calculator (one bankroll
+	// can host multiple game instances). This keeps the WASM source simple:
+	// no chunking, no cursor, no pagination.
+	maxBetsPerRound  = 100 // total bets per round
+	maxBetsPerBlock  = 100 // total place_bets per block (= round cap; one block can fill a round)
 )
 
 // Config layout (48 bytes):
@@ -109,6 +117,7 @@ var (
 	keyBetList = []byte("bl")
 	keyHistory = []byte("ch")
 	keyCashout = []byte("co") // pending cashout bet IDs
+	keyCalcID  = []byte("ci") // calculator ID — mixed into RNG entropy to de-correlate instances
 )
 
 // betKeyBuf is reused across calls to avoid heap allocation per betKey.
@@ -119,6 +128,33 @@ func betKey(id uint64) []byte {
 	betKeyBuf[0] = 'b'
 	binary.LittleEndian.PutUint64(betKeyBuf[1:], id)
 	return betKeyBuf[:]
+}
+
+// Auto-cashout bucket: one KV per tick. With round capped at 100 bets, a
+// bucket holds ≤100 betIDs (≤800 bytes), so a single kv_set per place_bet
+// stays bounded. handleTick reads + deletes the whole bucket on tick fire.
+var bucketKeyBuf [3]byte
+
+func autoBucketKey(tick uint64) []byte {
+	bucketKeyBuf[0] = 'a'
+	bucketKeyBuf[1] = 't'
+	bucketKeyBuf[2] = byte(tick)
+	return bucketKeyBuf[:]
+}
+
+func appendToAutoBucket(tick, betID uint64) {
+	key := autoBucketKey(tick)
+	existing := kvGetBytes(key)
+	buf := make([]byte, len(existing)+8)
+	copy(buf, existing)
+	binary.LittleEndian.PutUint64(buf[len(existing):], betID)
+	kvSet(key, buf)
+}
+
+func clearAutoBuckets() {
+	for tick := uint64(1); tick <= 134; tick++ {
+		kvDelete(autoBucketKey(tick))
+	}
 }
 
 // Round counter accessors — read/write running counters in round state.
@@ -143,9 +179,24 @@ func init_game(sentinelID, bankrollID, calculatorID uint64) {
 	binary.LittleEndian.PutUint64(rnBuf, 1)
 	kvSet([]byte("rn"), rnBuf)
 
+	// Store calculator ID — mixed into RNG entropy at every tick check so
+	// two crash instances on the same chain (sharing the block's DKG seed)
+	// produce independent crash points instead of locking in step.
+	idBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(idBuf, calculatorID)
+	kvSet(keyCalcID, idBuf)
+
 	cfg := kvGetOrInitCfg()
 	joinWindow := binary.LittleEndian.Uint64(cfg[32:40])
 	emitState("open", getRoundNumber(), uint64(10000), 0, joinWindow, 0, 0, 0, 0)
+}
+
+func getCalcID() uint64 {
+	v := kvGetBytes(keyCalcID)
+	if v == nil || len(v) < 8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +211,7 @@ func place_bet(betID, bankrollID, calculatorID, stake uint64, paramsPtr, paramsL
 	if round == nil {
 		round = newRound()
 		kvDelete(keyBetList)
+		clearAutoBuckets() // cleanse buckets carrying betIDs from previous round
 	}
 	if round[24] != phaseOpen {
 		return 10
@@ -168,28 +220,62 @@ func place_bet(betID, bankrollID, calculatorID, stake uint64, paramsPtr, paramsL
 		return 11
 	}
 
+	// Round bet cap — bounds end-of-round settlement work.
+	if binary.LittleEndian.Uint64(round[25:33]) >= maxBetsPerRound {
+		return 14
+	}
+	// Per-block bet cap — bounds in-block place_bet work.
+	if uint64(round[57]) >= maxBetsPerBlock {
+		return 15
+	}
+
+	maxMult := binary.LittleEndian.Uint64(cfg[16:24])
+
+	// Params layout (chain prepends 20-byte sender address):
+	//   [0..19]  sender_addr
+	//   [20..27] autocashout_tick (optional; 0 or absent ⇒ default to maxTick)
+	//
+	// A target of N means: when tick N survives the crash check, auto-settle
+	// at that tick's multiplier. Ticks are 1-indexed: tick 1 is the first
+	// post-open tick (~1.035x with 3.5% tick growth). Tick 134 is the highest
+	// meaningful tick before the multiplier hits the 100x cap.
+	const maxTick = 134
+	autocashoutTick := uint64(0)
+	if paramsLen >= 28 {
+		params := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(paramsPtr))), paramsLen)
+		autocashoutTick = binary.LittleEndian.Uint64(params[20:28])
+	}
+	if autocashoutTick == 0 {
+		autocashoutTick = maxTick // default — ride to the cap
+	}
+	if autocashoutTick > maxTick {
+		return 12
+	}
+
 	bet := make([]byte, betSize)
 	binary.LittleEndian.PutUint64(bet[0:], betID)
 	binary.LittleEndian.PutUint64(bet[8:], stake)
 	bet[16] = statusActive
+	binary.LittleEndian.PutUint64(bet[17:], autocashoutTick)
 	kvSet(betKey(betID), bet)
 	appendBetID(betID)
+	appendToAutoBucket(autocashoutTick, betID)
 
 	count := binary.LittleEndian.Uint64(round[25:33])
 	count++
 	binary.LittleEndian.PutUint64(round[25:], count)
 	setRoundActiveCount(round, roundActiveCount(round)+1)
 	setRoundTotalStake(round, roundTotalStake(round)+stake)
+	round[57]++ // per-block bet counter (reset by block_update)
 	kvSet(keyRound, round)
 
-	maxMult := binary.LittleEndian.Uint64(cfg[16:24])
 	maxPayout := safeMulDiv(stake, maxMult, 10000)
 	if host_reserve(betID, maxPayout) != 0 {
 		return 3
 	}
 
 	addr := getBettorAddr(betID)
-	emitJSON("joined", "bet_id", betID, "addr", addr, "stake", stake, "players", count)
+	emitJSON("joined", "bet_id", betID, "addr", addr, "stake", stake, "players", count, "autocashout_tick", autocashoutTick)
 	return 0
 }
 
@@ -223,6 +309,12 @@ func block_update(seedPtr uint32) {
 	if round == nil {
 		return
 	}
+	// Reset per-block bet counter at the start of every block_update. place_bet
+	// calls inside this block (Cosmos block N: BeginBlock(block_update) → DeliverTx
+	// → ...) all share this counter. Caps placements to maxBetsPerBlock per block.
+	round[57] = 0
+	kvSet(keyRound, round)
+
 	switch round[24] {
 	case phaseOpen:
 		handleOpen(round)
@@ -276,6 +368,7 @@ func handleOpen(round []byte) {
 
 func handleTick(round []byte, seed []byte) {
 	cfg := kvGetOrInitCfg()
+	rn := getRoundNumber()
 
 	currentMult := binary.LittleEndian.Uint64(round[0:8])
 	ticksElapsed := binary.LittleEndian.Uint64(round[8:16])
@@ -284,7 +377,6 @@ func handleTick(round []byte, seed []byte) {
 	maxMult := binary.LittleEndian.Uint64(cfg[16:24])
 	maxTicks := binary.LittleEndian.Uint64(cfg[24:32])
 
-	// Next multiplier.
 	nextMult := currentMult * (10000 + tickGrowth) / 10000
 	if nextMult > maxMult {
 		nextMult = maxMult
@@ -293,7 +385,7 @@ func handleTick(round []byte, seed []byte) {
 		nextMult = currentMult + 1
 	}
 
-	// Crash probability.
+	// Crash probability — house edge applied at first tick only.
 	var probSurvive float64
 	if ticksElapsed == 0 {
 		edge := float64(houseEdge) / 10000.0
@@ -305,34 +397,104 @@ func handleTick(round []byte, seed []byte) {
 		probSurvive = 1.0
 	}
 
-	rngVal := getUniformProb(seed, ticksElapsed)
+	rngVal := getUniformProb(seed, ticksElapsed, getCalcID())
 	crashed := rngVal >= probSurvive
-	rn := getRoundNumber()
 
-	// Load and clear cashouts.
 	cashoutIDs := loadAndDeleteCashouts()
 
 	if crashed {
 		pushHistory(currentMult)
-		settleAllAsLoss(round, rn, currentMult)
+		// Settle all bets inline. With round capped at 100 bets this fits in
+		// one block_update under the 10M WASM/SDK caps.
+		// - statusActive bets whose target_tick ≤ ticksElapsed (= max_survived):
+		//   honor the autocashout — pay at target tick's mult.
+		// - statusActive bets whose target_tick > ticksElapsed: loss.
+		// - statusCashoutReq bets: loss (existing rule: crash beats cashoutReq).
+		settleAllOnCrash(cfg, round, rn, ticksElapsed, currentMult)
+		// cashoutReq IDs were already in cashout list (now drained); their bets
+		// stay status=cashoutReq → settled as loss in settleAllOnCrash above.
+		_ = cashoutIDs
 		enterCrashed(round, rn, currentMult, ticksElapsed)
 		return
 	}
 
-	// Settle cashouts as wins — update running counters per cashout.
+	// Survived this tick. Migrate cashoutReq → bucket[thisTick] then drain
+	// bucket inline. With round capped at 100, the bucket fits one block.
+	thisTick := ticksElapsed + 1
 	for _, bid := range cashoutIDs {
 		bet := kvGetBytes(betKey(bid))
-		if bet == nil || bet[16] == statusSettled {
+		if bet == nil || bet[16] != statusCashoutReq {
+			continue
+		}
+		bet[16] = statusActive
+		binary.LittleEndian.PutUint64(bet[17:], thisTick)
+		kvSet(betKey(bid), bet)
+		appendToAutoBucket(thisTick, bid)
+	}
+	drainBucketInline(thisTick, nextMult, round, rn)
+
+	// Max ticks / max mult cap → settle remaining as wins, then crashed.
+	if maxTicks > 0 && ticksElapsed+1 >= maxTicks {
+		pushHistory(nextMult)
+		settleAllAsWin(round, rn, nextMult)
+		enterCrashed(round, rn, nextMult, ticksElapsed+1)
+		return
+	}
+	if nextMult >= maxMult {
+		pushHistory(maxMult)
+		settleAllAsWin(round, rn, maxMult)
+		enterCrashed(round, rn, maxMult, ticksElapsed)
+		return
+	}
+
+	binary.LittleEndian.PutUint64(round[0:], nextMult)
+	binary.LittleEndian.PutUint64(round[8:], ticksElapsed+1)
+	kvSet(keyRound, round)
+
+	count := binary.LittleEndian.Uint64(round[25:33])
+	emitState("tick", rn, nextMult, ticksElapsed+1, 0, count, roundActiveCount(round), roundCashedCount(round), roundTotalStake(round))
+}
+
+// computeTickMult returns the multiplier (in bp) at the given tick — pure
+// function of cfg + tick. Caps at max_multiplier_bp.
+func computeTickMult(cfg []byte, tick uint64) uint64 {
+	tickGrowth := binary.LittleEndian.Uint64(cfg[8:16])
+	maxMult := binary.LittleEndian.Uint64(cfg[16:24])
+	mult := uint64(10000)
+	for i := uint64(0); i < tick; i++ {
+		next := mult * (10000 + tickGrowth) / 10000
+		if next <= mult {
+			next = mult + 1
+		}
+		if next >= maxMult {
+			return maxMult
+		}
+		mult = next
+	}
+	return mult
+}
+
+// drainBucketInline settles every bet in bucket[tick] at multBP and deletes
+// the bucket. With round capped at 100 bets, the bucket holds ≤100 entries
+// and fits a single block_update under the 10M WASM/SDK caps.
+func drainBucketInline(tick, multBP uint64, round []byte, rn uint64) {
+	bucket := kvGetBytes(autoBucketKey(tick))
+	if len(bucket) == 0 {
+		return
+	}
+	for off := 0; off+8 <= len(bucket); off += 8 {
+		bid := binary.LittleEndian.Uint64(bucket[off : off+8])
+		bet := kvGetBytes(betKey(bid))
+		if bet == nil || len(bet) < betSize || bet[16] != statusActive {
 			continue
 		}
 		stake := binary.LittleEndian.Uint64(bet[8:16])
-		payout := safeMulDiv(stake, nextMult, 10000)
+		payout := safeMulDiv(stake, multBP, 10000)
 		addr := getBettorAddr(bid)
 		bet[16] = statusSettled
 		kvSet(betKey(bid), bet)
 		host_settle(bid, payout, kindWin)
 
-		// Update running counters.
 		ac := roundActiveCount(round)
 		if ac > 0 {
 			setRoundActiveCount(round, ac-1)
@@ -344,38 +506,103 @@ func handleTick(round []byte, seed []byte) {
 		} else {
 			setRoundTotalStake(round, 0)
 		}
-		emitJSON("cashout", "bet_id", bid, "addr", addr, "mult_bp", nextMult, "payout", payout)
+		emitJSON("cashout", "bet_id", bid, "addr", addr, "round", rn, "stake", stake, "tick", tick, "mult_bp", multBP, "payout", payout)
 	}
-
-	// Max ticks check.
-	if maxTicks > 0 && ticksElapsed+1 >= maxTicks {
-		pushHistory(nextMult)
-		settleRemainingAsWin(round, rn, nextMult)
-		enterCrashed(round, rn, nextMult, ticksElapsed+1)
-		return
-	}
-
-	// Max multiplier check.
-	if nextMult >= maxMult {
-		pushHistory(maxMult)
-		settleRemainingAsWin(round, rn, maxMult)
-		enterCrashed(round, rn, maxMult, ticksElapsed)
-		return
-	}
-
-	// Advance.
-	binary.LittleEndian.PutUint64(round[0:], nextMult)
-	binary.LittleEndian.PutUint64(round[8:], ticksElapsed+1)
-	kvSet(keyRound, round)
-
-	count := binary.LittleEndian.Uint64(round[25:33])
-	emitState("tick", rn, nextMult, ticksElapsed+1, 0, count, roundActiveCount(round), roundCashedCount(round), roundTotalStake(round))
+	kvDelete(autoBucketKey(tick))
 }
+
+// settleAllOnCrash walks the bet list and settles every non-settled bet:
+//   - statusActive with target_tick ≤ maxSurvivedTick → win at tick's mult
+//     (honors autocashouts whose tick was reached but bucket not yet drained
+//     on the crash block — e.g. when many players target the same tick)
+//   - statusActive with target_tick > maxSurvivedTick → loss
+//   - statusCashoutReq → loss (crash beats cashoutReq)
+//
+// With round ≤100 bets, this fits one block_update.
+func settleAllOnCrash(cfg, round []byte, rn, maxSurvivedTick, crashMult uint64) {
+	for _, bid := range loadBetIDs() {
+		bet := kvGetBytes(betKey(bid))
+		if bet == nil || len(bet) < betSize || bet[16] == statusSettled {
+			continue
+		}
+		stake := binary.LittleEndian.Uint64(bet[8:16])
+		targetTick := binary.LittleEndian.Uint64(bet[17:25])
+		origStatus := bet[16]
+		addr := getBettorAddr(bid)
+
+		var payout uint64
+		var kindCode uint32
+		var multForEvent uint64
+		if origStatus == statusActive && targetTick > 0 && targetTick <= maxSurvivedTick {
+			tickMult := computeTickMult(cfg, targetTick)
+			payout = safeMulDiv(stake, tickMult, 10000)
+			kindCode = kindWin
+			multForEvent = tickMult
+		} else {
+			payout = 0
+			kindCode = kindLoss
+			multForEvent = crashMult
+		}
+
+		bet[16] = statusSettled
+		kvSet(betKey(bid), bet)
+		host_settle(bid, payout, kindCode)
+		emitJSON("settled", "bet_id", bid, "addr", addr, "payout", payout, "kind", uint64(kindCode), "round", rn, "stake", stake, "mult_bp", multForEvent)
+
+		if kindCode == kindWin {
+			setRoundCashedCount(round, roundCashedCount(round)+1)
+		}
+		ac := roundActiveCount(round)
+		if ac > 0 {
+			setRoundActiveCount(round, ac-1)
+		}
+		ts := roundTotalStake(round)
+		if stake <= ts {
+			setRoundTotalStake(round, ts-stake)
+		} else {
+			setRoundTotalStake(round, 0)
+		}
+	}
+}
+
+// settleAllAsWin pays every remaining non-settled bet at multBP. Used when
+// the round hits the max-tick or max-mult cap.
+func settleAllAsWin(round []byte, rn, multBP uint64) {
+	for _, bid := range loadBetIDs() {
+		bet := kvGetBytes(betKey(bid))
+		if bet == nil || len(bet) < betSize || bet[16] == statusSettled {
+			continue
+		}
+		stake := binary.LittleEndian.Uint64(bet[8:16])
+		payout := safeMulDiv(stake, multBP, 10000)
+		addr := getBettorAddr(bid)
+		bet[16] = statusSettled
+		kvSet(betKey(bid), bet)
+		host_settle(bid, payout, kindWin)
+		emitJSON("settled", "bet_id", bid, "addr", addr, "payout", payout, "kind", uint64(kindWin), "round", rn, "stake", stake, "mult_bp", multBP)
+
+		setRoundCashedCount(round, roundCashedCount(round)+1)
+		ac := roundActiveCount(round)
+		if ac > 0 {
+			setRoundActiveCount(round, ac-1)
+		}
+		ts := roundTotalStake(round)
+		if stake <= ts {
+			setRoundTotalStake(round, ts-stake)
+		} else {
+			setRoundTotalStake(round, 0)
+		}
+	}
+}
+
 
 // ---------------------------------------------------------------------------
 // Phase: CRASHED — cooldown before next round
 // ---------------------------------------------------------------------------
 
+// enterCrashed transitions to crashed phase. All bet settlement happened
+// inline in handleTick (settleAllOnCrash / settleAllAsWin); this function
+// just sets state and starts the cooldown countdown.
 func enterCrashed(round []byte, rn, crashMult, finalTick uint64) {
 	round[24] = phaseCrashed
 	cfg := kvGetOrInitCfg()
@@ -389,16 +616,17 @@ func enterCrashed(round []byte, rn, crashMult, finalTick uint64) {
 	kvSet(keyRound, round)
 
 	count := binary.LittleEndian.Uint64(round[25:33])
-	emitState("crashed", rn, crashMult, finalTick, cooldown, count, 0, roundCashedCount(round), roundTotalStake(round))
+	emitState("crashed", rn, crashMult, finalTick, cooldown, count, 0, roundCashedCount(round), 0)
 }
 
+// handleCrashed counts down cooldown blocks, then restarts the round.
 func handleCrashed(round []byte) {
-	remaining := binary.LittleEndian.Uint64(round[16:24])
 	rn := getRoundNumber()
 	crashMult := binary.LittleEndian.Uint64(round[0:8])
 	finalTick := binary.LittleEndian.Uint64(round[8:16])
 	count := binary.LittleEndian.Uint64(round[25:33])
 
+	remaining := binary.LittleEndian.Uint64(round[16:24])
 	if remaining > 1 {
 		remaining--
 		binary.LittleEndian.PutUint64(round[16:], remaining)
@@ -406,8 +634,6 @@ func handleCrashed(round []byte) {
 		emitState("crashed", rn, crashMult, finalTick, remaining, count, 0, 0, 0)
 		return
 	}
-
-	// Cooldown over — restart.
 	markSettledAndRestart()
 }
 
@@ -418,6 +644,7 @@ func markSettledAndRestart() {
 	}
 	kvDelete(keyBetList)
 	kvDelete(keyCashout)
+	clearAutoBuckets() // wipe stale autocashout buckets from this round
 
 	newR := newRound()
 	kvSet(keyRound, newR)
@@ -430,49 +657,6 @@ func markSettledAndRestart() {
 	cfg := kvGetOrInitCfg()
 	joinWindow := binary.LittleEndian.Uint64(cfg[32:40])
 	emitState("open", rn, 10000, 0, joinWindow, 0, 0, 0, 0)
-}
-
-// ---------------------------------------------------------------------------
-// Settlement helpers
-// ---------------------------------------------------------------------------
-
-func settleAllAsLoss(round []byte, rn uint64, crashMultBP uint64) {
-	betIDs := loadBetIDs()
-	for _, bid := range betIDs {
-		bet := kvGetBytes(betKey(bid))
-		if bet == nil || bet[16] == statusSettled {
-			continue
-		}
-		stake := binary.LittleEndian.Uint64(bet[8:16])
-		addr := getBettorAddr(bid)
-		bet[16] = statusSettled
-		kvSet(betKey(bid), bet)
-		host_settle(bid, 0, kindLoss)
-		emitJSON("settled", "bet_id", bid, "addr", addr, "payout", uint64(0), "kind", uint64(kindLoss), "round", rn, "stake", stake, "mult_bp", crashMultBP)
-	}
-	setRoundActiveCount(round, 0)
-	setRoundTotalStake(round, 0)
-}
-
-func settleRemainingAsWin(round []byte, rn uint64, multBP uint64) {
-	betIDs := loadBetIDs()
-	for _, bid := range betIDs {
-		bet := kvGetBytes(betKey(bid))
-		if bet == nil || bet[16] == statusSettled {
-			continue
-		}
-		stake := binary.LittleEndian.Uint64(bet[8:16])
-		payout := safeMulDiv(stake, multBP, 10000)
-		addr := getBettorAddr(bid)
-		bet[16] = statusSettled
-		kvSet(betKey(bid), bet)
-		host_settle(bid, payout, kindWin)
-		emitJSON("settled", "bet_id", bid, "addr", addr, "payout", payout, "kind", uint64(kindWin), "round", rn, "stake", stake, "mult_bp", multBP)
-	}
-	ac := roundActiveCount(round)
-	setRoundCashedCount(round, roundCashedCount(round)+ac)
-	setRoundActiveCount(round, 0)
-	setRoundTotalStake(round, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -691,10 +875,14 @@ func safeMulDiv(a, b, c uint64) uint64 {
 	return q<<64 + (r<<64+low)/c
 }
 
-func getUniformProb(seed []byte, tickNum uint64) float64 {
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], tickNum)
-	data := make([]byte, len(seed)+8)
+// getUniformProb derives a uniform [0,1) value from (seed, tickNum, calcID).
+// calcID is mixed in so two crash calculators sharing the same DKG seed at
+// the same block height produce independent crash outcomes.
+func getUniformProb(seed []byte, tickNum, calcID uint64) float64 {
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[0:], tickNum)
+	binary.LittleEndian.PutUint64(buf[8:], calcID)
+	data := make([]byte, len(seed)+16)
 	copy(data, seed)
 	copy(data[len(seed):], buf[:])
 	sum := sha256sum(data)
@@ -806,9 +994,10 @@ func query() *byte {
 		first = false
 		stake := binary.LittleEndian.Uint64(bet[8:16])
 		status := "active"
-		if bet[16] == statusSettled {
+		switch bet[16] {
+		case statusSettled:
 			status = "out"
-		} else if bet[16] == statusCashoutReq {
+		case statusCashoutReq:
 			status = "cashout_pending"
 		}
 		addr := getBettorAddr(bid)
@@ -883,7 +1072,10 @@ func info() *byte {
 			"place_bet":{
 				"3":"Insufficient bankroll liquidity",
 				"10":"Round not accepting bets — wait for next round",
-				"11":"Already joined this round"
+				"11":"Already joined this round",
+				"12":"Invalid autocashout tick — must be 1..134 (0 or absent ⇒ defaults to 134)",
+				"14":"Round full — max 100 players per round, wait for next round",
+				"15":"Block full — max 100 bets per block, retry next block"
 			},
 			"bet_action":{
 				"20":"Round not in tick phase — cannot cashout yet",

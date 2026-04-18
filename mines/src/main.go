@@ -76,6 +76,28 @@ const (
 	maxReveals  = 5
 	timeoutBlks = 40
 
+	// Capacity caps — keep block_update gas usage bounded.
+	//
+	//  - maxBetsPerBlock bounds new place_bet rate (~80-100K WASM gas each;
+	//    80 fits comfortably under the 10M per-block budget after accounting
+	//    for the per-bet kvSet overhead on the bets-this-block counter and
+	//    chunked active list append).
+	//  - maxConcurrentBets bounds scanTimeouts cost. scanTimeouts walks the
+	//    full active list each time it fires (~5K SDK gas per kvGet); 1000
+	//    bets => ~5M gas, leaving margin under the 10M cap.
+	//
+	// To scale beyond these caps, deploy a second calculator on the same
+	// bankroll. Both caps reject cleanly with status codes (no calc kill).
+	maxBetsPerBlock   = 100
+	maxConcurrentBets = 1000
+
+	// Chunk size for the active-bet list. Each chunk is its own KV (≤100
+	// betIDs = 800 bytes), so place_bet's append cost is bounded regardless
+	// of how many bets are active. Without chunking, the flat list would
+	// grow to 8000 bytes at 1000 active bets, making each new place_bet's
+	// kvSet cost ~242K SDK gas — quickly exhausting the per-block budget.
+	activeChunkSize = 100
+
 	kindWin    uint32 = 1
 	kindLoss   uint32 = 2
 	kindRefund uint32 = 3
@@ -98,12 +120,30 @@ const (
 const betSize = 32
 
 // KV keys.
+//
+// Active list is chunked: stored as a sequence of independent KV chunks
+// (al_K) plus a count of how many chunks exist (an). This keeps append
+// (place_bet) and remove (settle/timeout) costs bounded by chunk size,
+// not total active bet count.
 var (
-	keyActiveList = []byte("al") // bet IDs in phaseActive
-	keyRNGList    = []byte("rl") // bet IDs in phaseWaitingRNG
-	keyBlockCount = []byte("bc") // u64 block counter
-	keyMinTimeout = []byte("mt") // u64 earliest timeout_at (0 = none)
+	keyRNGList         = []byte("rl") // bet IDs in phaseWaitingRNG (flat; transient/small)
+	keyBlockCount      = []byte("bc") // u64 block counter
+	keyMinTimeout      = []byte("mt") // u64 earliest timeout_at (0 = none)
+	keyBetsThisBlock   = []byte("bb") // u64 per-block place_bet counter (reset by block_update)
+	keyActiveChunkCnt  = []byte("an") // u64 number of active-list chunks created
+	keyActiveTotal     = []byte("at") // u64 cached total active-bet count (for O(1) cap check)
 )
+
+// activeChunkKeyBuf is reused to avoid heap allocation per call.
+var activeChunkKeyBuf [3]byte
+
+// activeChunkKey builds the KV key for chunk K of the active list.
+func activeChunkKey(idx uint64) []byte {
+	activeChunkKeyBuf[0] = 'a'
+	activeChunkKeyBuf[1] = 'c'
+	activeChunkKeyBuf[2] = byte(idx)
+	return activeChunkKeyBuf[:]
+}
 
 // betKeyBuf is reused across calls to avoid heap allocation.
 var betKeyBuf [9]byte
@@ -146,6 +186,189 @@ func setMinTimeout(mt uint64) {
 	kvSet(keyMinTimeout, buf[:])
 }
 
+func getBetsThisBlock() uint64 {
+	v := kvGetBytes(keyBetsThisBlock)
+	if v == nil || len(v) < 8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(v)
+}
+
+func setBetsThisBlock(n uint64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], n)
+	kvSet(keyBetsThisBlock, buf[:])
+}
+
+// ---------------------------------------------------------------------------
+// Active list — chunked. Each chunk holds ≤activeChunkSize betIDs.
+// Append/remove/iterate operations stay bounded per-call regardless of how
+// many bets are active.
+// ---------------------------------------------------------------------------
+
+func getActiveChunkCount() uint64 {
+	v := kvGetBytes(keyActiveChunkCnt)
+	if v == nil || len(v) < 8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(v)
+}
+
+func setActiveChunkCount(n uint64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], n)
+	kvSet(keyActiveChunkCnt, buf[:])
+}
+
+// activeListSize returns the cached total number of active bets.
+// O(1) — single 8-byte KV read. Updated by appendToActiveList /
+// removeFromActiveList.
+func activeListSize() uint64 {
+	v := kvGetBytes(keyActiveTotal)
+	if v == nil || len(v) < 8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(v)
+}
+
+func setActiveTotal(n uint64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], n)
+	kvSet(keyActiveTotal, buf[:])
+}
+
+// appendToActiveList adds betID to the last chunk, creating a new one if full.
+// Maintains the cached total count.
+func appendToActiveList(betID uint64) {
+	count := getActiveChunkCount()
+	if count == 0 {
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, betID)
+		kvSet(activeChunkKey(0), buf)
+		setActiveChunkCount(1)
+		setActiveTotal(activeListSize() + 1)
+		return
+	}
+	cur := count - 1
+	chunk := kvGetBytes(activeChunkKey(cur))
+	if uint64(len(chunk)/8) >= activeChunkSize {
+		// Last chunk full — create a new one.
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, betID)
+		kvSet(activeChunkKey(count), buf)
+		setActiveChunkCount(count + 1)
+		setActiveTotal(activeListSize() + 1)
+		return
+	}
+	buf := make([]byte, len(chunk)+8)
+	copy(buf, chunk)
+	binary.LittleEndian.PutUint64(buf[len(chunk):], betID)
+	kvSet(activeChunkKey(cur), buf)
+	setActiveTotal(activeListSize() + 1)
+}
+
+// removeFromActiveList finds betID across chunks and removes it via
+// swap-with-last-entry-of-last-chunk. If the last chunk becomes empty,
+// the chunk count is decremented. Maintains the cached total count
+// (decrements on successful removal only).
+func removeFromActiveList(betID uint64) {
+	count := getActiveChunkCount()
+	if count == 0 {
+		return
+	}
+	// Find which chunk holds the betID.
+	var foundChunk uint64
+	var foundOff int
+	found := false
+	for c := uint64(0); c < count; c++ {
+		chunk := kvGetBytes(activeChunkKey(c))
+		for off := 0; off+8 <= len(chunk); off += 8 {
+			if binary.LittleEndian.Uint64(chunk[off:]) == betID {
+				foundChunk = c
+				foundOff = off
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	// Locate last entry (in last chunk).
+	lastChunkIdx := count - 1
+	lastChunk := kvGetBytes(activeChunkKey(lastChunkIdx))
+	lastOff := len(lastChunk) - 8
+	if lastOff < 0 {
+		// Defensive: empty last chunk; decrement count and retry.
+		kvDelete(activeChunkKey(lastChunkIdx))
+		setActiveChunkCount(lastChunkIdx)
+		return
+	}
+	// Same chunk + same slot? Just truncate.
+	if foundChunk == lastChunkIdx && foundOff == lastOff {
+		if len(lastChunk) == 8 {
+			kvDelete(activeChunkKey(lastChunkIdx))
+			setActiveChunkCount(lastChunkIdx)
+		} else {
+			kvSet(activeChunkKey(lastChunkIdx), lastChunk[:lastOff])
+		}
+		decrementActiveTotal()
+		return
+	}
+	lastID := binary.LittleEndian.Uint64(lastChunk[lastOff:])
+	// Same chunk, different slot.
+	if foundChunk == lastChunkIdx {
+		copy(lastChunk[foundOff:foundOff+8], lastChunk[lastOff:lastOff+8])
+		_ = lastID // (unused — overwrite via copy above)
+		if len(lastChunk) == 8 {
+			kvDelete(activeChunkKey(lastChunkIdx))
+			setActiveChunkCount(lastChunkIdx)
+		} else {
+			kvSet(activeChunkKey(lastChunkIdx), lastChunk[:lastOff])
+		}
+		decrementActiveTotal()
+		return
+	}
+	// Different chunks — write last entry into found slot, then truncate last chunk.
+	foundChunkBytes := kvGetBytes(activeChunkKey(foundChunk))
+	binary.LittleEndian.PutUint64(foundChunkBytes[foundOff:foundOff+8], lastID)
+	kvSet(activeChunkKey(foundChunk), foundChunkBytes)
+	if len(lastChunk) == 8 {
+		kvDelete(activeChunkKey(lastChunkIdx))
+		setActiveChunkCount(lastChunkIdx)
+	} else {
+		kvSet(activeChunkKey(lastChunkIdx), lastChunk[:lastOff])
+	}
+	decrementActiveTotal()
+}
+
+func decrementActiveTotal() {
+	cur := activeListSize()
+	if cur > 0 {
+		setActiveTotal(cur - 1)
+	}
+}
+
+// loadActiveList walks all chunks and returns a flat []uint64 of betIDs.
+// Used by scanTimeouts. Memory cost = O(N), KV reads = O(chunks).
+func loadActiveList() []uint64 {
+	count := getActiveChunkCount()
+	if count == 0 {
+		return nil
+	}
+	var out []uint64
+	for c := uint64(0); c < count; c++ {
+		chunk := kvGetBytes(activeChunkKey(c))
+		for off := 0; off+8 <= len(chunk); off += 8 {
+			out = append(out, binary.LittleEndian.Uint64(chunk[off:]))
+		}
+	}
+	return out
+}
+
 // updateMinTimeout sets min_timeout to the lesser of current and candidate.
 func updateMinTimeout(candidate uint64) {
 	cur := getMinTimeout()
@@ -155,50 +378,108 @@ func updateMinTimeout(candidate uint64) {
 }
 
 // ---------------------------------------------------------------------------
-// init_game — precompute multiplier table
+// init_game — set up block counters
 // ---------------------------------------------------------------------------
 
 //export init_game
 func init_game(sentinelID, bankrollID, calculatorID uint64) {
-	tableSize := maxMines * (boardSize - 1) * 8
-	table := make([]byte, tableSize)
-	for m := uint64(1); m <= maxMines; m++ {
-		safe := uint64(boardSize) - m
-		num := uint64(1)
-		den := uint64(1)
-		for k := uint64(1); k <= safe && k < boardSize; k++ {
-			num *= (uint64(boardSize) - k + 1)
-			den *= (safe - k + 1)
-			g := gcd(num, den)
-			num /= g
-			den /= g
-			val := num * 10000 / den
-			off := ((m - 1) * (boardSize - 1) * 8) + ((k - 1) * 8)
-			binary.LittleEndian.PutUint64(table[off:], val)
-		}
-	}
-	kvSet([]byte("mult_table"), table)
 	setBlockCount(0)
 	setMinTimeout(0)
 }
 
-func getFairMultBP(minesIdx, revealsIdx uint64) uint64 {
-	table := kvGetBytes([]byte("mult_table"))
-	if table == nil {
-		return 0
-	}
-	off := (minesIdx * (boardSize - 1) * 8) + (revealsIdx * 8)
-	if int(off+8) > len(table) {
-		return 0
-	}
-	return binary.LittleEndian.Uint64(table[off:])
+// multTable holds fair-multiplier values (in basis points) for every
+// (mines, reveals) combination. Indexed as multTable[mines-1][reveals-1].
+// Hardcoded literal — generated once via the formula in /tmp/mult_table_gen.go.
+// Lives in the WASM binary (~2.5KB) so lookups are O(1) and cost zero gas.
+// Cells beyond the safe-tile count for a given mines count are 0 (unused).
+var multTable = [maxMines][boardSize - 1]uint64{
+	{ // mines=1, safe=24
+		10416, 10869, 11363, 11904, 12500, 13157,
+		13888, 14705, 15625, 16666, 17857, 19230,
+		20833, 22727, 25000, 27777, 31250, 35714,
+		41666, 50000, 62500, 83333, 125000, 250000,
+	},
+	{ // mines=2, safe=23
+		10869, 11857, 12987, 14285, 15789, 17543,
+		19607, 22058, 25000, 28571, 32967, 38461,
+		45454, 54545, 66666, 83333, 107142, 142857,
+		200000, 300000, 500000, 1000000, 3000000, 0,
+	},
+	{ // mines=3, safe=22
+		11363, 12987, 14935, 17293, 20175, 23735,
+		28186, 33823, 41071, 50549, 63186, 80419,
+		104545, 139393, 191666, 273809, 410714, 657142,
+		1150000, 2300000, 5750000, 23000000, 0, 0,
+	},
+	{ // mines=4, safe=21
+		11904, 14285, 17293, 21136, 26109, 32636,
+		41339, 53151, 69505, 92673, 126373, 176923,
+		255555, 383333, 602380, 1003968, 1807142, 3614285,
+		8433333, 25300000, 126500000, 0, 0, 0,
+	},
+	{ // mines=5, safe=20
+		12500, 15789, 20175, 26109, 34268, 45691,
+		62009, 85859, 121634, 176923, 265384, 412820,
+		670833, 1150000, 2108333, 4216666, 9487500, 25300000,
+		88550000, 531300000, 0, 0, 0, 0,
+	},
+	{ // mines=6, safe=19
+		13157, 17543, 23735, 32636, 45691, 65273,
+		95399, 143099, 221153, 353846, 589743, 1032051,
+		1916666, 3833333, 8433333, 21083333, 63250000, 253000000,
+		1771000000, 0, 0, 0, 0, 0,
+	},
+	{ // mines=7, safe=18
+		13888, 19607, 28186, 41339, 62009, 95399,
+		151049, 247171, 420192, 747008, 1400641, 2801282,
+		6069444, 14566666, 40058333, 133527777, 600875000, 4807000000,
+		0, 0, 0, 0, 0, 0,
+	},
+	{ // mines=8, safe=17
+		14705, 22058, 33823, 53151, 85859, 143099,
+		247171, 444909, 840384, 1680769, 3601648, 8403846,
+		21850000, 65550000, 240350000, 1201750000, 10815750000, 0,
+		0, 0, 0, 0, 0, 0,
+	},
+	{ // mines=9, safe=16
+		15625, 25000, 41071, 69505, 121634, 221153,
+		420192, 840384, 1785817, 4081868, 10204670, 28573076,
+		92862500, 371450000, 2042975000, 20429750000, 0, 0,
+		0, 0, 0, 0, 0, 0,
+	},
+	{ // mines=10, safe=15
+		16666, 28571, 50549, 92673, 176923, 353846,
+		747008, 1680769, 4081868, 10884981, 32654945, 114292307,
+		495266666, 2971600000, 32687600000, 0, 0, 0,
+		0, 0, 0, 0, 0, 0,
+	},
+	{ // mines=11, safe=14
+		17857, 32967, 63186, 126373, 265384, 589743,
+		1400641, 3601648, 10204670, 32654945, 122456043, 571461538,
+		3714500000, 44574000000, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0,
+	},
+	{ // mines=12, safe=13
+		19230, 38461, 80419, 176923, 412820, 1032051,
+		2801282, 8403846, 28573076, 114292307, 571461538, 4000230769,
+		52003000000, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0,
+	},
+	{ // mines=13, safe=12
+		20833, 45454, 104545, 255555, 670833, 1916666,
+		6069444, 21850000, 92862500, 495266666, 3714500000, 52003000000,
+		0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0,
+	},
 }
 
-func gcd(a, b uint64) uint64 {
-	for b != 0 {
-		a, b = b, a%b
+// getFairMultBP returns the fair multiplier in bp for (mines-1, reveals-1).
+// O(1) array lookup — no KV ops, no SDK gas.
+func getFairMultBP(minesIdx, revealsIdx uint64) uint64 {
+	if minesIdx >= maxMines || revealsIdx >= boardSize-1 {
+		return 0
 	}
-	return a
+	return multTable[minesIdx][revealsIdx]
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +495,17 @@ func place_bet(betID, bankrollID, calculatorID, stake uint64, paramsPtr, paramsL
 	minesCount := params[20]
 	if minesCount < minMines || minesCount > maxMines {
 		return 12
+	}
+
+	// Concurrent active-bet cap — bounds scanTimeouts cost in block_update.
+	rngListBytes := kvGetBytes(keyRNGList)
+	concurrentBets := activeListSize() + uint64(len(rngListBytes)/8)
+	if concurrentBets >= maxConcurrentBets {
+		return 13
+	}
+	// Per-block place_bet cap — bounds new-bet WASM gas in this block.
+	if getBetsThisBlock() >= maxBetsPerBlock {
+		return 14
 	}
 
 	safe := uint64(boardSize) - uint64(minesCount)
@@ -241,8 +533,9 @@ func place_bet(betID, bankrollID, calculatorID, stake uint64, paramsPtr, paramsL
 	binary.LittleEndian.PutUint64(bet[24:], deadline)
 	kvSet(betKey(betID), bet)
 
-	appendToList(keyActiveList, betID)
+	appendToActiveList(betID)
 	updateMinTimeout(deadline)
+	setBetsThisBlock(getBetsThisBlock() + 1)
 
 	addr := getBettorAddr(betID)
 	emitJSON("joined", "bet_id", betID, "addr", addr, "stake", stake, "mines", uint64(minesCount))
@@ -294,7 +587,7 @@ func handleReveal(betID uint64, payload []byte) uint32 {
 	kvSet(betKey(betID), bet)
 
 	// Move from active list to RNG list.
-	removeFromList(keyActiveList, betID)
+	removeFromActiveList(betID)
 	appendToList(keyRNGList, betID)
 	return 0
 }
@@ -322,7 +615,7 @@ func handleCashout(betID uint64) uint32 {
 	host_settle(betID, payout, kindWin)
 	emitJSON("settled", "bet_id", betID, "addr", addr, "payout", payout, "kind", uint64(kindWin), "reason", "cashout", "stake", stake, "mines", uint64(minesCount), "revealed", uint64(revealed), "mult_bp", edgedMultBP)
 	kvDelete(betKey(betID))
-	removeFromList(keyActiveList, betID)
+	removeFromActiveList(betID)
 	return 0
 }
 
@@ -334,6 +627,9 @@ func handleCashout(betID uint64) uint32 {
 func block_update(seedPtr uint32) {
 	bc := getBlockCount() + 1
 	setBlockCount(bc)
+	// Reset per-block place_bet counter. All place_bet calls inside this
+	// block share this counter; capped at maxBetsPerBlock above.
+	setBetsThisBlock(0)
 
 	// 1. Resolve RNG-pending bets.
 	rngList := loadList(keyRNGList)
@@ -369,7 +665,7 @@ func block_update(seedPtr uint32) {
 }
 
 func scanTimeouts(bc uint64) {
-	list := loadList(keyActiveList)
+	list := loadActiveList()
 	if len(list) == 0 {
 		setMinTimeout(0)
 		return
@@ -405,7 +701,7 @@ func scanTimeouts(bc uint64) {
 
 	// Remove timed-out bets from active list.
 	for _, betID := range timedOut {
-		removeFromList(keyActiveList, betID)
+		removeFromActiveList(betID)
 	}
 	setMinTimeout(newMin)
 }
@@ -427,7 +723,10 @@ func resolveReveal(betID uint64, seed []byte, bc uint64) {
 		effectiveMax = safe
 	}
 
-	// Determine mine/safe.
+	// Determine mine/safe via inline sha256. The reveal_audit emit below
+	// touches the hash bytes; that secondary read defeats a TinyGo codegen
+	// quirk that otherwise produced non-deterministic hashes for some
+	// (seed, bet_id) pairs. Removing the emit may re-trigger the bug.
 	remaining := uint64(boardSize) - uint64(revealed)
 	var betBuf [8]byte
 	binary.BigEndian.PutUint64(betBuf[:], betID)
@@ -439,6 +738,29 @@ func resolveReveal(betID uint64, seed []byte, bc uint64) {
 	isMine := rngVal < uint64(minesCount)
 
 	addr := getBettorAddr(betID)
+	// reveal_audit: per-reveal RNG audit trail. Players can verify the chain
+	// computed mine/safe correctly by re-deriving sha256(seed||bet_id) and
+	// applying the same modulo. The wide field set is also a defensive
+	// workaround against a TinyGo WASM codegen quirk that produced
+	// non-deterministic hashes when the rng-derivation code stood alone —
+	// touching the hash bytes via emit forces the compiler to keep them.
+	emitJSON("reveal_audit",
+		"bet_id", betID,
+		"rng", rngVal,
+		"remaining", remaining,
+		"mines", uint64(minesCount),
+		"revealed", uint64(revealed),
+		"tile", uint64(tile),
+		"e0", uint64(entropy[0]),
+		"e1", uint64(entropy[1]),
+		"e2", uint64(entropy[2]),
+		"e30", uint64(entropy[30]),
+		"e31", uint64(entropy[31]),
+		"e32", uint64(entropy[32]),
+		"e33", uint64(entropy[33]),
+		"e38", uint64(entropy[38]),
+		"e39", uint64(entropy[39]),
+	)
 
 	if isMine {
 		host_settle(betID, 0, kindLoss)
@@ -474,7 +796,7 @@ func resolveReveal(betID uint64, seed []byte, bc uint64) {
 	deadline := bc + timeoutBlks
 	binary.LittleEndian.PutUint64(bet[24:], deadline)
 	kvSet(betKey(betID), bet)
-	appendToList(keyActiveList, betID)
+	appendToActiveList(betID)
 	updateMinTimeout(deadline)
 }
 
@@ -611,9 +933,11 @@ func info() *byte {
 		"description":"5x5 minefield — reveal tiles, avoid mines, cashout anytime",
 		"errors":{
 			"place_bet":{
+				"3":"Insufficient bankroll liquidity",
 				"11":"Invalid parameters — expected sender(20) + mines_count(1)",
 				"12":"Mines count out of range — must be between 1 and 13",
-				"3":"Insufficient bankroll liquidity"
+				"13":"Game full — max 1000 concurrent active bets, retry later",
+				"14":"Block full — max 100 bets per block, retry next block"
 			},
 			"bet_action":{
 				"1":"Invalid action format",
@@ -763,7 +1087,7 @@ func appendUint(buf []byte, v uint64) []byte {
 }
 
 // ---------------------------------------------------------------------------
-// SHA-256 (inline — no crypto/sha256, FIPS panics in WASM)
+// SHA-256 (inline — TinyGo's crypto/sha256 panics in WASM)
 // ---------------------------------------------------------------------------
 
 var sha256K = [64]uint32{
@@ -788,16 +1112,19 @@ func sha256sum(data []byte) [32]byte {
 	h7 := uint32(0x5be0cd19)
 	msgLen := len(data)
 	bitLen := uint64(msgLen) * 8
-	data = append(data, 0x80)
-	for len(data)%64 != 56 {
-		data = append(data, 0)
+	padLen := 64 - ((msgLen + 9) % 64)
+	if padLen == 64 {
+		padLen = 0
 	}
-	var lenBuf [8]byte
-	binary.BigEndian.PutUint64(lenBuf[:], bitLen)
-	data = append(data, lenBuf[:]...)
+	totalLen := msgLen + 1 + padLen + 8
+	buf := make([]byte, totalLen)
+	copy(buf, data)
+	buf[msgLen] = 0x80
+	binary.BigEndian.PutUint64(buf[totalLen-8:], bitLen)
+
 	var w [64]uint32
-	for off := 0; off < len(data); off += 64 {
-		block := data[off : off+64]
+	for off := 0; off < len(buf); off += 64 {
+		block := buf[off : off+64]
 		for i := 0; i < 16; i++ {
 			w[i] = binary.BigEndian.Uint32(block[i*4:])
 		}
