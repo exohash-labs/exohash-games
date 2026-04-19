@@ -62,8 +62,8 @@ None. Dice settles automatically next block.
 
 | Topic | Fields | When |
 |---|---|---|
-| `bet` | `entry_id`, `stake`, `chance_bp`, `max_payout` | place_bet |
-| `settle` | `entry_id`, `roll`, `chance_bp`, `eff_chance_bp`, `mult_bp`, `payout`, `result`, `stake`, `addr` | Next block |
+| `bet` | `bet_id`, `stake`, `chance_bp`, `max_payout` | place_bet |
+| `settle` | `bet_id`, `roll`, `chance_bp`, `eff_chance_bp`, `mult_bp`, `payout`, `result`, `stake`, `addr` | Next block |
 | `roll_audit` | entropy bytes | Settlement (audit trail) |
 
 `result`: 1 = win, 2 = loss.

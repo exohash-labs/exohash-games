@@ -155,7 +155,7 @@ func place_bet(betID, bankrollID, calculatorID, stake uint64, paramsPtr, paramsL
 	addPending(betID)
 	setBetsThisBlock(getBetsThisBlock() + 1)
 
-	emitJSON("bet", "entry_id", betID, "stake", stake, "chance_bp", chance, "max_payout", maxPayout)
+	emitJSON("bet", "bet_id", betID, "stake", stake, "chance_bp", chance, "max_payout", maxPayout)
 	return 0
 }
 
@@ -403,8 +403,8 @@ func emitJSON(topic string, pairs ...interface{}) {
 	)
 }
 
-func emitSettleJSON(entryID, roll, chance, effChance, mult, payout, stake uint64, addr, result string) {
-	json := fmtJSON("entry_id", entryID, "roll", roll, "chance_bp", chance, "eff_chance_bp", effChance, "mult_bp", mult, "payout", payout, "result", result, "stake", stake, "addr", addr)
+func emitSettleJSON(betID, roll, chance, effChance, mult, payout, stake uint64, addr, result string) {
+	json := fmtJSON("bet_id", betID, "roll", roll, "chance_bp", chance, "eff_chance_bp", effChance, "mult_bp", mult, "payout", payout, "result", result, "stake", stake, "addr", addr)
 	topic := []byte("settle")
 	jsonBytes := []byte(json)
 	host_emit_event(
