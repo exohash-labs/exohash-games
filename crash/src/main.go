@@ -617,6 +617,18 @@ func enterCrashed(round []byte, rn, crashMult, finalTick uint64) {
 
 	count := binary.LittleEndian.Uint64(round[25:33])
 	emitState("crashed", rn, crashMult, finalTick, cooldown, count, 0, roundCashedCount(round), 0)
+
+	// Round-terminal marker — emitted exactly once per round at the
+	// crash transition. Distinct topic so consumers can filter cheaply
+	// without scanning every state event's data for phase="crashed".
+	// Used by the play UI to load bust history on reload.
+	emitJSON("round_crashed",
+		"round", rn,
+		"mult_bp", crashMult,
+		"tick", finalTick,
+		"players", count,
+		"cashed", roundCashedCount(round),
+	)
 }
 
 // handleCrashed counts down cooldown blocks, then restarts the round.
