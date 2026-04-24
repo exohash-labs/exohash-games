@@ -37,7 +37,7 @@ The crash point is determined by mixing the validator-DKG beacon seed with the r
   ```
 - **Verify**: `sha256sum crash.wasm` must match the deployed calculator's hash on [ExoScan](https://devnet.exohash.io).
 
-Current shipped hash: `687ba794fc8aad37a64bd6226adf2a47f10e5dea8b62b1bd276725d3df3e1e25`
+Current shipped hash: `25a66f691a7975a6c9a6b21731cd415e3e1067aa589e1025d9fef380266edc5e`
 
 ---
 

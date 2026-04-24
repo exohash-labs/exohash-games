@@ -38,7 +38,7 @@ The multiplier curve is `safe / remaining_safe`, edge-adjusted by 1%. Higher min
   ```
 - **Verify**: `sha256sum mines.wasm` must match the deployed calculator's hash on [ExoScan](https://devnet.exohash.io).
 
-Current shipped hash: `8801762827addfa851c8910090376861574e300607b2b217f4efdc3eadcfb3ac`
+Current shipped hash: `c71f93c1d690766f28a9ff7060a0314168eb5dc66107265cb957112dbd9738ad`
 
 Every reveal also emits a `reveal_audit` event containing the entropy bytes used — third parties can replay the RNG and verify each tile placement.
 

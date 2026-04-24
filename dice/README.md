@@ -36,7 +36,7 @@ A 50% bet pays ~1.98x. A 1% bet pays ~98x. A 98% bet pays ~1.01x. Edge is taken 
   ```
 - **Verify**: `sha256sum dice.wasm` must match the deployed calculator's hash on [ExoScan](https://devnet.exohash.io).
 
-Current shipped hash: `c569f2ea7e92d53ddc2086d11167b30f8a7e8e57e1f0ca77f5ff9e21ed6aa38b`
+Current shipped hash: `0251e74f776bffb3ada856b140457c5af85bcaf76c63aec318e6bf48387edde2`
 
 Every settlement emits a `roll_audit` event containing the entropy bytes — third parties can replay the RNG and verify the outcome.
 
